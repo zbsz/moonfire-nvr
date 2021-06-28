@@ -82,16 +82,11 @@ pub struct Args {
 // They seem to be correct for Linux and macOS at least.
 const LOCALTIME_PATH: &str = "/etc/localtime";
 const TIMEZONE_PATH: &str = "/etc/timezone";
-const ZONEINFO_PATHS: [&str; 2] = [
-    "/usr/share/zoneinfo/",       // Linux, macOS < High Sierra
-    "/var/db/timezone/zoneinfo/", // macOS High Sierra
-];
+const ZONEINFO: &str = "/zoneinfo/";
 
 fn trim_zoneinfo(path: &str) -> &str {
-    for zp in &ZONEINFO_PATHS {
-        if let Some(p) = path.strip_prefix(zp) {
-            return p;
-        }
+    if let Some(ind) = path.rfind(ZONEINFO) {
+        return &path[(ind + ZONEINFO.len())..];
     }
     path
 }
