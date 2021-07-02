@@ -4,6 +4,7 @@
 
 use crate::streamer;
 use crate::web;
+use crate::onvif;
 use base::clock;
 use db::{dir, writer};
 use failure::{bail, Error};
@@ -311,6 +312,28 @@ async fn async_run(args: &Args) -> Result<i32, Error> {
     let server_handle = tokio::spawn(server);
 
     info!("Ready to serve HTTP requests");
+
+    // subscribe for onvif events
+    {
+        let l = db.lock();
+        for camera in l.cameras_by_id().values() {
+            if let (Some(user), Some(passwd)) = (&camera.username, &camera.password) {
+                let uri = "http://".to_owned() + &camera.onvif_host + ":8000";
+                println!("Trying to subscribe to onvif host: '{}'", uri);
+                match url::Url::parse(uri.as_str()) {
+                    Ok(base_uri) => {
+                        let client = onvif::OnvifClient::new(base_uri, user.as_str(), passwd.as_str()).await;
+                        println!("got client: {:?}", client.is_ok());
+
+                    }
+                    Err(err) => println!("{}", err),
+                }
+            }
+        }
+        drop(l);
+    }
+
+
     shutdown.await;
     shutdown_tx.send(()).unwrap();
 

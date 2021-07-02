@@ -5,6 +5,7 @@
 use crate::body::Body;
 use crate::json;
 use crate::mp4;
+use crate::onvif;
 use base::{bail_t, ErrorKind};
 use base::{clock::Clocks, format_err_t};
 use core::borrow::Borrow;
@@ -67,12 +68,16 @@ enum Path {
     StreamLiveMp4Segments(Uuid, db::StreamType),      // "/api/cameras/<uuid>/<type>/live.m4s"
     Login,                                            // "/api/login"
     Logout,                                           // "/api/logout"
+    Onvif,                                            // "/onvif/..."
     Static,                                           // (anything that doesn't start with "/api/")
     NotFound,
 }
 
 impl Path {
     fn decode(path: &str) -> Self {
+        if path.starts_with("/onvif/") {
+            return Path::Onvif
+        }
         if !path.starts_with("/api/") {
             return Path::Static;
         }
@@ -302,9 +307,6 @@ fn extract_sid(req: &Request<hyper::Body>) -> Option<auth::RawSessionId> {
 /// deserialization. Keeping the bytes allows the caller to use a `Deserialize`
 /// that borrows from the bytes.
 async fn extract_json_body(req: &mut Request<hyper::Body>) -> Result<Bytes, HttpError> {
-    if *req.method() != http::method::Method::POST {
-        return Err(plain_response(StatusCode::METHOD_NOT_ALLOWED, "POST expected").into());
-    }
     let correct_mime_type = match req.headers().get(header::CONTENT_TYPE) {
         Some(t) if t == "application/json" => true,
         Some(t) if t == "application/json; charset=UTF-8" => true,
@@ -313,11 +315,31 @@ async fn extract_json_body(req: &mut Request<hyper::Body>) -> Result<Bytes, Http
     if !correct_mime_type {
         return Err(bad_req("expected application/json request body"));
     }
+    extract_bytes(req).await
+}
+
+async fn extract_bytes(req: &mut Request<hyper::Body>) -> Result<Bytes, HttpError> {
+    if *req.method() != http::method::Method::POST {
+        return Err(plain_response(StatusCode::METHOD_NOT_ALLOWED, "POST expected").into());
+    }
     let b = ::std::mem::replace(req.body_mut(), hyper::Body::empty());
     hyper::body::to_bytes(b)
         .await
         .map_err(|e| internal_server_err(format_err!("unable to read request body: {}", e)))
 }
+
+/// Extracts an `application/xml+soap` POST body from a request.
+async fn extract_soap_xml_body(req: &mut Request<hyper::Body>) -> Result<Bytes, HttpError> {
+    let content_type = match req.headers().get(header::CONTENT_TYPE) {
+        Some(header) => header.to_str().map_err(|e| bad_req("missing content type header"))?,
+        _ => "",
+    };
+    if !content_type.contains("application/soap+xml") {
+        return Err(bad_req("expected application/soap+xml request body"));
+    }
+    extract_bytes(req).await
+}
+
 
 pub struct Config<'a> {
     pub db: Arc<db::Database>,
@@ -614,6 +636,7 @@ impl Service {
                 self.signals(req, caller).await?,
             ),
             Path::Static => (CacheControl::None, self.static_file(req).await?),
+            Path::Onvif => (CacheControl::None, self.onvif(req).await?)
         };
         match cache {
             CacheControl::PrivateStatic => {
@@ -646,7 +669,7 @@ impl Service {
         let p = Path::decode(req.uri().path());
         let always_allow_unauthenticated = matches!(
             p,
-            Path::NotFound | Path::Request | Path::Login | Path::Logout | Path::Static
+            Path::NotFound | Path::Request | Path::Login | Path::Logout | Path::Static | Path::Onvif
         );
         debug!("request on: {}: {:?}", req.uri(), p);
         let caller = match self.authenticate(&req, always_allow_unauthenticated) {
@@ -699,6 +722,13 @@ impl Service {
             req,
             &json::Camera::wrap(camera, &db, true, false).map_err(internal_server_err)?,
         )
+    }
+
+    async fn onvif(&self, mut req: Request<::hyper::Body>) -> ResponseResult {
+        println!("GOT NOTIFICATION: {:?}", &req);
+        let b = extract_soap_xml_body(&mut req).await?;
+        onvif::process_notification(b).await;
+        Ok(plain_response(StatusCode::OK, "OK"))
     }
 
     fn stream_recordings(
